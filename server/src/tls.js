@@ -1,6 +1,6 @@
 import forge from 'node-forge';
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { hostname, networkInterfaces } from 'node:os';
 import { DATA_DIR } from './db.js';
@@ -31,7 +31,7 @@ function makeCA() {
   cert.publicKey = k.pub; cert.serialNumber = serial();
   cert.validity.notBefore = new Date(Date.now() - DAY);
   cert.validity.notAfter = new Date(Date.now() + 3650 * DAY);
-  const subject = [{ name: 'commonName', value: 'Caisse Magasin - Autorité locale' }, { name: 'organizationName', value: 'Caisse Magasin' }];
+  const subject = [{ name: 'commonName', value: 'Caisse Magasin - Autorite locale' }, { name: 'organizationName', value: 'Caisse Magasin' }];
   cert.setSubject(subject); cert.setIssuer(subject);
   cert.setExtensions([
     { name: 'basicConstraints', cA: true, critical: true },
@@ -74,6 +74,13 @@ function makeLeaf(ca, names, ips) {
  */
 export function ensureTls() {
   mkdirSync(CERT_DIR, { recursive: true });
+  // Ancienne autorité avec un accent (« é » interdit en PrintableString → ERR_SSL_SERVER_CERT_BAD_FORMAT) : on la refait.
+  const caBad = existsSync(f('ca.pem'))
+    && forge.pki.certificateFromPem(readFileSync(f('ca.pem'), 'utf8')).subject.attributes.some((a) => /[^\x00-\x7f]/.test(a.value));
+  if (caBad) {
+    for (const n of ['ca.pem', 'ca-key.pem', 'server.pem', 'server-key.pem', 'server.json']) rmSync(f(n), { force: true });
+    console.log('🔐 Ancienne autorité invalide supprimée : les appareils doivent réinstaller le certificat (/install).');
+  }
   if (!existsSync(f('ca.pem')) || !existsSync(f('ca-key.pem'))) {
     const ca = makeCA();
     writeFileSync(f('ca.pem'), ca.certPem);

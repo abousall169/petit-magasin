@@ -16,6 +16,8 @@ if not exist client\dist (
   call npm install
   call npm run build
 )
+rem --- Le certificat HTTPS couvre toujours le point d'acces mobile Windows, meme s'il est active apres la caisse.
+set "TLS_NAMES=192.168.137.1,%TLS_NAMES%"
 echo Demarrage de la caisse... (fermer cette fenetre arrete la caisse)
 npm start -w server
 pause

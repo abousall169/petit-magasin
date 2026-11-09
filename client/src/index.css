@@ -1,0 +1,31 @@
+@import "tailwindcss";
+
+:root { color-scheme: light; }
+html, body, #root { height: 100%; }
+body {
+  background: #f1f5f9; color: #0f172a; -webkit-tap-highlight-color: transparent;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans Arabic", "Noto Naskh Arabic", Tahoma, sans-serif;
+  overscroll-behavior-y: none;
+}
+button, input, select { font: inherit; }
+@layer components {
+.btn { @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-3 font-semibold transition active:scale-[.97] disabled:opacity-40 disabled:active:scale-100; min-height: 48px; }
+.btn-primary { @apply bg-green-600 text-white hover:bg-green-700; }
+.btn-secondary { @apply bg-slate-200 text-slate-800 hover:bg-slate-300; }
+.btn-danger { @apply bg-red-600 text-white hover:bg-red-700; }
+.input { @apply w-full rounded-xl border border-slate-300 bg-white px-3 py-3 outline-none focus:border-green-600 focus:ring-2 focus:ring-green-600/30; min-height: 48px; }
+.card { @apply rounded-2xl bg-white shadow-sm border border-slate-200; }
+.label { @apply mb-1 block text-sm font-medium text-slate-600; }
+}
+
+/* Ticket : n'imprime que le reçu (imprimante thermique 58/80 mm) */
+#receipt-print, #labels-print { display: none; }
+@media print {
+  @page { margin: 0; }
+  #root { display: none !important; } /* seuls les tickets et feuilles (portails dans body) sont imprimés */
+  body * { visibility: hidden; }
+  html, body, #root { height: auto; background: #fff; }
+  #receipt-print, #receipt-print *, #labels-print, #labels-print * { visibility: visible; }
+  #labels-print { display: block; position: absolute; inset-inline-start: 0; top: 0; width: 210mm; }
+  #receipt-print { display: block; position: absolute; inset-inline-start: 0; top: 0; width: 72mm; padding: 3mm; color: #000; font-size: 12px; line-height: 1.35; }
+}

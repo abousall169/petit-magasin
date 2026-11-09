@@ -1,0 +1,13 @@
+{
+  "name": "magasin",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Application de vente locale pour magasins (profil : alimentation)",
+  "workspaces": ["server", "client"],
+  "scripts": {
+    "dev:server": "npm run dev -w server",
+    "dev:client": "npm run dev -w client",
+    "build": "npm run build -w client",
+    "start": "npm run build && npm start -w server"
+  }
+}

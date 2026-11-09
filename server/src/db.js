@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hashPin } from './auth.js';
 import { alimentation } from './profiles/alimentation.js';
+import { migrate } from './migrations.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const DATA_DIR = process.env.DATA_DIR || resolve(__dirname, '../../data');
@@ -103,6 +104,8 @@ CREATE INDEX IF NOT EXISTS idx_sales_created ON sales(created_at);
 CREATE INDEX IF NOT EXISTS idx_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);
 `);
+
+migrate(db, { dataDir: DATA_DIR });
 
 /** Exécute fn dans une transaction (BEGIN IMMEDIATE = écritures sérialisées). */
 export function tx(fn) {

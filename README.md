@@ -19,6 +19,17 @@ Ensuite, plus besoin de `demarrer.bat`. Journaux : `data\logs\`. Pour tout retir
 Après une mise à jour du code : relancer `installer-demarrage-auto.bat` (recompile si besoin et redémarre).
 Remarque : sous le compte système, une imprimante installée seulement pour *votre* utilisateur peut ne pas être vue ; dans ce cas, installez avec `powershell -File scripts\install-autostart.ps1 -Mode Logon` (démarrage à l'ouverture de session, sans droits administrateur).
 
+## Fonctions
+- **Vente** : espèces, Wave, Orange Money, mobile money, crédit, ou plusieurs moyens sur une même vente. Remise par article ou sur le ticket, prix modifiable, paniers mis de côté, ticket par WhatsApp ou SMS, facture A4.
+- **Clients** : carnet de dettes, remboursements, plafond de crédit, rappel par WhatsApp.
+- **Stock** : achats et fournisseurs, lots avec péremption (le lot qui périme le plus tôt part en premier), historique des mouvements, import/export CSV, catégories.
+- **Gestion** : rapport par jour, semaine, mois, année ou période, bénéfice, dépenses, ouverture et clôture de caisse, impression et export CSV.
+- **Hors ligne** : l'application rouvre sans le PC si un employé était déjà connecté. Les ventes partent au retour du réseau, avec leur vraie date, et ne sont jamais perdues : le gérant est prévenu si l'une d'elles pose problème (*Ventes → À vérifier*).
+- **Paiements mobiles** : l'application enregistre le moyen et le n° de transaction, mais ne vérifie pas le paiement auprès de Wave ou d'Orange Money. Le caissier contrôle le message reçu.
+- Réglages du gérant : TVA, droits des vendeurs (remise maximale, prix, crédit), papier 58 ou 80 mm, tiroir-caisse, monnaie (sans centimes), français / arabe / anglais.
+
+**PIN du gérant oublié** : sur le PC du magasin, double-cliquer sur `reinitialiser-pin-gerant.bat`.
+
 ## Installer sur un téléphone / une tablette (une seule fois par appareil)
 La caméra (scan de codes-barres) et le mode hors-ligne exigent HTTPS. Le serveur crée sa propre autorité de certification locale ; chaque appareil doit l'installer une fois :
 1. Sur l'appareil, ouvrir `http://<ip-du-pc>:3000/install` (adresse affichée dans la console) et suivre les étapes (Android / iPhone / arabe).
@@ -51,8 +62,10 @@ Le ticket est dessiné en image (français et arabe corrects) puis envoyé à l'
 - `npm run dev:server` (API, port 3000) et `npm run dev:client` (interface, port 5173, proxy vers l'API).
 
 ## Données
-- Base SQLite : `data/magasin.db`. Sauvegardes automatiques dans `data/backups/` (14 jours). **Copiez `data/` sur une clé USB régulièrement.**
+- Base SQLite : `data/magasin.db`. Sauvegardes automatiques toutes les 6 heures dans `data/backups/` (14 jours).
+- *Réglages → Sauvegardes* : télécharger une sauvegarde, restaurer, et indiquer un dossier du PC où la copier automatiquement (clé USB, Google Drive pour ordinateur). **Sans ce dossier, les sauvegardes restent sur le même disque que les données.**
+- Avant chaque mise à jour de la structure de la base, une copie est faite dans `data/avant-mise-a-jour/`.
 
 ## Structure
-- `server/` API Fastify + SQLite (`node:sqlite`). `server/src/profiles/alimentation.js` = ce qui est propre au type de magasin. `tls.js` (HTTPS), `print/` (impression).
+- `server/` API Fastify + SQLite (`node:sqlite`). `server/src/profiles/alimentation.js` = ce qui est propre au type de magasin. `migrations.js` (évolutions de la base), `tls.js` (HTTPS), `print/` (impression).
 - `client/` PWA React + Tailwind (FR/AR, RTL).

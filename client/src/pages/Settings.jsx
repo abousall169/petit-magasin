@@ -1,9 +1,11 @@
-import { useEffect, useState } from 'react';
-import { api } from '../api.js';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { api, download } from '../api.js';
 import { useApp } from '../ctx.js';
-import { errText } from '../i18n.js';
+import { errText, LANGS } from '../i18n.js';
 import { printReceiptBitmap, sampleSale } from '../printer.js';
 import Modal from '../components/Modal.jsx';
+
+const LANG_NAMES = { fr: 'Français', ar: 'العربية', en: 'English' };
 
 export default function Settings() {
   const { user, settings, t, lang, setLang, notify, reloadAll } = useApp();
@@ -13,17 +15,26 @@ export default function Settings() {
       <h1 className="text-lg font-bold">{t.settings}</h1>
       <section className="card p-4">
         <h2 className="mb-2 font-bold">{t.language}</h2>
-        <div className="grid grid-cols-2 gap-2">
-          <button className={`btn ${lang === 'fr' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setLang('fr')}>Français</button>
-          <button className={`btn ${lang === 'ar' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setLang('ar')}>العربية</button>
+        <div className="grid grid-cols-3 gap-2">
+          {LANGS.map((l) => <button key={l} className={`btn ${lang === l ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setLang(l)}>{LANG_NAMES[l]}</button>)}
         </div>
       </section>
       <MyPin t={t} notify={notify} />
       {isManager && <Shop settings={settings} t={t} notify={notify} reloadAll={reloadAll} />}
+      {isManager && <Tax settings={settings} t={t} notify={notify} reloadAll={reloadAll} />}
+      {isManager && <SellerRules settings={settings} t={t} notify={notify} reloadAll={reloadAll} />}
       {isManager && <PrinterSection settings={settings} user={user} lang={lang} t={t} notify={notify} reloadAll={reloadAll} />}
       {isManager && <Team t={t} notify={notify} />}
+      {isManager && <Backups t={t} notify={notify} />}
     </div>
   );
+}
+
+function useSaveSettings({ t, notify, reloadAll }) {
+  return async (body) => {
+    try { await api('/settings', { method: 'PUT', body }); await reloadAll(); notify(t.saved); }
+    catch (e) { notify(errText(t, e.code), 'err'); }
+  };
 }
 
 function PrinterSection({ settings, user, lang, t, notify, reloadAll }) {
@@ -33,13 +44,15 @@ function PrinterSection({ settings, user, lang, t, notify, reloadAll }) {
   const [ip, setIp] = useState(cur.startsWith('tcp:') ? cur.slice(4) : '');
   const [auto, setAuto] = useState(!!settings.auto_print);
   const [cut, setCut] = useState(settings.printer_cut !== false);
+  const [paper, setPaper] = useState(settings.paper_width ?? 80);
+  const [drawer, setDrawer] = useState(!!settings.cash_drawer);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => { api('/printers').then((r) => setPrinters(r.printers ?? [])).catch(() => {}); }, []);
 
   const value = mode === 'tcp' ? (ip.trim() ? `tcp:${ip.trim()}` : '') : mode;
   const save = async () => {
-    await api('/settings', { method: 'PUT', body: { printer: value, auto_print: auto && !!value, printer_cut: cut } });
+    await api('/settings', { method: 'PUT', body: { printer: value, auto_print: auto && !!value, printer_cut: cut, paper_width: paper, cash_drawer: drawer && !!value } });
     await reloadAll();
   };
   const onSave = async () => {
@@ -49,16 +62,20 @@ function PrinterSection({ settings, user, lang, t, notify, reloadAll }) {
     setBusy(true);
     try {
       await save();
-      await printReceiptBitmap(sampleSale(user), { lang, t, shop: settings.shop_name, footer: settings.ticket_footer });
+      await printReceiptBitmap(sampleSale(user), { lang, t, shop: settings.shop_name, footer: settings.ticket_footer, paper, address: settings.shop_address, phone: settings.shop_phone, taxId: settings.shop_tax_id });
       notify(t.printSent);
     } catch (e) {
       notify(`${t.printFailed}${e.data?.detail ? ` : ${e.data.detail}` : ''}`, 'err');
     } finally { setBusy(false); }
   };
+  const openDrawer = async () => {
+    try { await save(); await api('/drawer', { method: 'POST' }); }
+    catch (e) { notify(`${t.printFailed}${e.data?.detail ? ` : ${e.data.detail}` : ''}`, 'err'); }
+  };
 
   return (
     <section className="card space-y-3 p-4">
-      <h2 className="font-bold">🖨 {t.printer} (80 mm)</h2>
+      <h2 className="font-bold">🖨 {t.printer}</h2>
       <select className="input" value={mode} onChange={(e) => setMode(e.target.value)}>
         <option value="">{t.printerNone}</option>
         {printers.map((p) => <option key={p.name} value={`usb:${p.name}`}>{p.name}</option>)}
@@ -70,12 +87,18 @@ function PrinterSection({ settings, user, lang, t, notify, reloadAll }) {
         <div><label className="label">{t.printerIp}</label>
           <input className="input" dir="ltr" inputMode="decimal" value={ip} onChange={(e) => setIp(e.target.value)} placeholder="192.168.1.50:9100" /></div>
       )}
+      <div><label className="label">{t.paperWidth}</label>
+        <div className="grid grid-cols-2 gap-2">
+          {[80, 58].map((w) => <button key={w} className={`btn !min-h-10 !py-1 ${paper === w ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setPaper(w)}>{w} mm</button>)}
+        </div></div>
       <label className="flex items-center gap-3"><input type="checkbox" className="h-5 w-5" checked={auto} onChange={(e) => setAuto(e.target.checked)} />{t.autoPrint}</label>
       <label className="flex items-center gap-3"><input type="checkbox" className="h-5 w-5" checked={cut} onChange={(e) => setCut(e.target.checked)} />{t.cutPaper}</label>
+      <label className="flex items-center gap-3"><input type="checkbox" className="h-5 w-5" checked={drawer} onChange={(e) => setDrawer(e.target.checked)} />{t.cashDrawerAuto}</label>
       <div className="grid grid-cols-2 gap-2">
         <button className="btn btn-secondary" disabled={busy || !value} onClick={onTest}>{t.testPrint}</button>
         <button className="btn btn-primary" onClick={onSave}>{t.save}</button>
       </div>
+      {drawer && <button className="btn btn-secondary w-full" disabled={!value} onClick={openDrawer}>💰 {t.openDrawer}</button>}
     </section>
   );
 }
@@ -97,17 +120,58 @@ function MyPin({ t, notify }) {
 }
 
 function Shop({ settings, t, notify, reloadAll }) {
-  const [f, setF] = useState({ shop_name: settings.shop_name ?? '', ticket_footer: settings.ticket_footer ?? '', allow_negative_stock: !!settings.allow_negative_stock });
-  const save = async () => {
-    try { await api('/settings', { method: 'PUT', body: f }); await reloadAll(); notify(t.saved); } catch (e) { notify(errText(t, e.code), 'err'); }
-  };
+  const [f, setF] = useState({
+    shop_name: settings.shop_name ?? '', shop_address: settings.shop_address ?? '', shop_phone: settings.shop_phone ?? '', shop_tax_id: settings.shop_tax_id ?? '',
+    ticket_footer: settings.ticket_footer ?? '', allow_negative_stock: !!settings.allow_negative_stock, currency: settings.currency ?? 'FCFA', phone_prefix: settings.phone_prefix ?? '221',
+  });
+  const save = useSaveSettings({ t, notify, reloadAll });
+  const text = (k, label, extra = {}) => <div><label className="label">{label}</label><input className="input" value={f[k]} onChange={(e) => setF({ ...f, [k]: e.target.value })} {...extra} /></div>;
   return (
     <section className="card space-y-3 p-4">
       <h2 className="font-bold">{t.shop}</h2>
-      <div><label className="label">{t.shopName}</label><input className="input" value={f.shop_name} onChange={(e) => setF({ ...f, shop_name: e.target.value })} /></div>
-      <div><label className="label">{t.ticketFooter}</label><input className="input" value={f.ticket_footer} onChange={(e) => setF({ ...f, ticket_footer: e.target.value })} /></div>
+      {text('shop_name', t.shopName)}
+      {text('shop_address', t.address)}
+      {text('shop_phone', t.phone, { dir: 'ltr', inputMode: 'tel' })}
+      {text('shop_tax_id', t.shopTaxId)}
+      {text('ticket_footer', t.ticketFooter)}
+      <div className="grid grid-cols-2 gap-3">
+        {text('currency', t.currency)}
+        {text('phone_prefix', t.phonePrefix, { dir: 'ltr', inputMode: 'numeric' })}
+      </div>
+      <p className="text-sm text-slate-500">{t.currencyHint}</p>
       <label className="flex items-center gap-3"><input type="checkbox" className="h-5 w-5" checked={f.allow_negative_stock} onChange={(e) => setF({ ...f, allow_negative_stock: e.target.checked })} />{t.allowNeg}</label>
-      <button className="btn btn-primary w-full" onClick={save}>{t.save}</button>
+      <button className="btn btn-primary w-full" onClick={() => save(f)}>{t.save}</button>
+    </section>
+  );
+}
+
+function Tax({ settings, t, notify, reloadAll }) {
+  const [enabled, setEnabled] = useState(!!settings.tax_enabled);
+  const [rate, setRate] = useState(String(settings.tax_rate ?? 18));
+  const save = useSaveSettings({ t, notify, reloadAll });
+  return (
+    <section className="card space-y-3 p-4">
+      <h2 className="font-bold">{t.taxSection}</h2>
+      <label className="flex items-center gap-3"><input type="checkbox" className="h-5 w-5" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />{t.taxEnabled}</label>
+      {enabled && <div><label className="label">{t.taxRate} (%)</label><input className="input" inputMode="decimal" value={rate} onChange={(e) => setRate(e.target.value.replace(/[^\d.]/g, ''))} /></div>}
+      <p className="text-sm text-slate-500">{t.taxHint}</p>
+      <button className="btn btn-primary w-full" onClick={() => save({ tax_enabled: enabled, tax_rate: Number(rate) || 0 })}>{t.save}</button>
+    </section>
+  );
+}
+
+function SellerRules({ settings, t, notify, reloadAll }) {
+  const [max, setMax] = useState(String(settings.seller_max_discount ?? 100));
+  const [price, setPrice] = useState(!!settings.seller_can_change_price);
+  const [credit, setCredit] = useState(settings.seller_can_credit !== false);
+  const save = useSaveSettings({ t, notify, reloadAll });
+  return (
+    <section className="card space-y-3 p-4">
+      <h2 className="font-bold">{t.sellerRules}</h2>
+      <div><label className="label">{t.sellerMaxDiscount} (%)</label><input className="input" inputMode="numeric" value={max} onChange={(e) => setMax(e.target.value.replace(/\D/g, ''))} /></div>
+      <label className="flex items-center gap-3"><input type="checkbox" className="h-5 w-5" checked={price} onChange={(e) => setPrice(e.target.checked)} />{t.sellerCanChangePrice}</label>
+      <label className="flex items-center gap-3"><input type="checkbox" className="h-5 w-5" checked={credit} onChange={(e) => setCredit(e.target.checked)} />{t.sellerCanCredit}</label>
+      <button className="btn btn-primary w-full" disabled={Number(max) > 100} onClick={() => save({ seller_max_discount: Number(max) || 0, seller_can_change_price: price, seller_can_credit: credit })}>{t.save}</button>
     </section>
   );
 }
@@ -153,6 +217,62 @@ function Team({ t, notify }) {
           </div>
         </Modal>
       )}
+    </section>
+  );
+}
+
+function Backups({ t, notify }) {
+  const [data, setData] = useState(null);
+  const [dir, setDir] = useState('');
+  const [busy, setBusy] = useState(false);
+  const file = useRef(null);
+  const load = useCallback(() => {
+    api('/backups').then((d) => { setData(d); setDir(d.dir); }).catch(() => {});
+  }, []);
+  useEffect(load, [load]);
+
+  const guard = async (fn) => {
+    setBusy(true);
+    try { await fn(); } catch (e) { notify(errText(t, e.code), 'err'); } finally { setBusy(false); }
+  };
+  const restored = () => { window.alert(t.restoreDone); window.location.reload(); };
+  const restoreName = (name) => {
+    if (window.confirm(`${t.restoreConfirm}\n\n${name}`)) guard(async () => { await api(`/backups/${name}/restore`, { method: 'POST' }); restored(); });
+  };
+  const restoreFile = (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (f && window.confirm(`${t.restoreConfirm}\n\n${f.name}`)) guard(async () => { await api('/backups-upload/restore', { method: 'POST', body: f, binary: true }); restored(); });
+  };
+  const size = (n) => `${(n / 1048576).toFixed(1)} Mo`;
+  const last = data?.lastCopy;
+
+  return (
+    <section className="card space-y-3 p-4">
+      <h2 className="font-bold">💾 {t.backups}</h2>
+      <p className="text-sm text-slate-500">{t.backupHint}</p>
+      <button className="btn btn-primary w-full" disabled={busy} onClick={() => guard(async () => { await api('/backups', { method: 'POST' }); load(); notify(t.saved); })}>{t.backupNow}</button>
+      <div>
+        <label className="label">{t.backupDir}</label>
+        <div className="flex gap-2">
+          <input className="input" dir="ltr" placeholder="E:\sauvegardes" value={dir} onChange={(e) => setDir(e.target.value)} />
+          <button className="btn btn-secondary" disabled={busy} onClick={() => guard(async () => { await api('/backups/dir', { method: 'PUT', body: { dir } }); load(); notify(t.saved); })}>{t.save}</button>
+        </div>
+        {last && <p className={`mt-1 text-sm ${last.ok ? 'text-green-700' : 'text-red-600'}`}>{last.ok ? `✓ ${t.lastCopy} : ${last.at}` : `✗ ${last.at} : ${last.error}`}</p>}
+      </div>
+      <div className="max-h-64 overflow-y-auto">
+        {data?.files.map((f) => (
+          <div key={f.name} className="flex items-center justify-between gap-2 border-b border-slate-100 py-2 text-sm">
+            <span className="min-w-0"><span className="block truncate font-medium" dir="ltr">{f.name}</span><span className="text-slate-500">{f.date} · {size(f.size)}</span></span>
+            <span className="flex shrink-0 gap-1">
+              <button className="btn btn-secondary !min-h-9 !px-3 !py-1" aria-label={t.downloadBackup} title={t.downloadBackup} onClick={() => guard(() => download(`/backups/${f.name}`, f.name))}>⬇</button>
+              <button className="btn btn-secondary !min-h-9 !px-3 !py-1" disabled={busy} onClick={() => restoreName(f.name)}>{t.restore}</button>
+            </span>
+          </div>
+        ))}
+      </div>
+      <input ref={file} type="file" accept=".db" className="hidden" onChange={restoreFile} />
+      <button className="btn btn-secondary w-full" disabled={busy} onClick={() => file.current?.click()}>⬆ {t.restoreFromFile}</button>
     </section>
   );
 }

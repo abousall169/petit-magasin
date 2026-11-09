@@ -1,9 +1,17 @@
 import { db, tx, getSetting, setSetting } from './db.js';
-import { listPrinters, escposFromBitmap, validateBitmap, sendToPrinter } from './print/print.js';
+import { listPrinters, escposFromBitmap, validateBitmap, sendToPrinter, DRAWER_PULSE } from './print/print.js';
 import {
   hashPin, verifyPin, createSession, requireAuth, requireManager,
   checkRateLimit, recordAttempt,
 } from './auth.js';
+import { fail, broadcast, addSseClient, isDate, text } from './util.js';
+import { addLot, addMovement, changeStock, consumeLots, syncExpiry } from './stock.js';
+import { saleRoutes, saleManagerRoutes } from './sales.js';
+import { customerRoutes, customerManagerRoutes } from './customers.js';
+import { purchaseRoutes } from './purchases.js';
+import { cashRoutes } from './cash.js';
+import { reportRoutes } from './reports.js';
+import { backupRoutes } from './backup.js';
 
 // Modèle de vision utilisé côté navigateur (DINOv2-small quantifié) : 384 (CLS) + 384 (moyenne des patchs) dimensions.
 export const VISION_MODEL = 'dinov2-small-q8';
@@ -18,22 +26,15 @@ const internalEan13 = (id) => {
   return body + ((10 - (sum % 10)) % 10);
 };
 
-const fail = (status, error, extra = {}) =>
-  Object.assign(new Error(error), { status, extra });
-
 const validPin = (p) => /^\d{4,6}$/.test(String(p ?? ''));
-
-// ---- Temps réel (Server-Sent Events) : le stock se met à jour sur tous les appareils ----
-const sseClients = new Set();
-function broadcast(event, data = {}) {
-  const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of sseClients) res.write(msg);
-}
+const LANGS = ['fr', 'ar', 'en'];
+const flag = (k, d = '0') => getSetting(k, d) === '1';
 
 export default async function routes(app) {
   app.setErrorHandler((err, req, reply) => {
     if (err.status) return reply.code(err.status).send({ error: err.message, ...err.extra });
     if (err.validation) return reply.code(400).send({ error: 'invalid_input', detail: err.message });
+    if (err.statusCode && err.statusCode < 500) return reply.code(err.statusCode).send({ error: 'invalid_input' });
     req.log.error(err);
     reply.code(500).send({ error: 'server_error' });
   });
@@ -77,9 +78,9 @@ export default async function routes(app) {
         Connection: 'keep-alive',
       });
       res.write('retry: 3000\n\n');
-      sseClients.add(res);
+      const remove = addSseClient(res);
       const ping = setInterval(() => res.write(': ping\n\n'), 25_000);
-      req.raw.on('close', () => { clearInterval(ping); sseClients.delete(res); });
+      req.raw.on('close', () => { clearInterval(ping); remove(); });
     });
 
     api.get('/api/me', async (req) => req.user);
@@ -92,7 +93,7 @@ export default async function routes(app) {
 
     api.put('/api/me/lang', async (req) => {
       const lang = req.body?.lang;
-      if (!['fr', 'ar'].includes(lang)) throw fail(400, 'invalid_input');
+      if (!LANGS.includes(lang)) throw fail(400, 'invalid_input');
       db.prepare('UPDATE employees SET lang=? WHERE id=?').run(lang, req.user.id);
       return { ok: true };
     });
@@ -110,15 +111,26 @@ export default async function routes(app) {
     // ---- Paramètres ----
     api.get('/api/settings', async () => ({
       shop_name: getSetting('shop_name'),
+      shop_address: getSetting('shop_address', ''),
+      shop_phone: getSetting('shop_phone', ''),
+      shop_tax_id: getSetting('shop_tax_id', ''),
       ticket_footer: getSetting('ticket_footer'),
-      allow_negative_stock: getSetting('allow_negative_stock', '0') === '1',
+      allow_negative_stock: flag('allow_negative_stock'),
       printer: getSetting('printer', ''),
-      auto_print: getSetting('auto_print', '0') === '1',
-      printer_cut: getSetting('printer_cut', '1') === '1',
-      currency: 'FCFA',
+      auto_print: flag('auto_print'),
+      printer_cut: flag('printer_cut', '1'),
+      paper_width: Number(getSetting('paper_width', '80')),
+      cash_drawer: flag('cash_drawer'),
+      tax_enabled: flag('tax_enabled'),
+      tax_rate: Number(getSetting('tax_rate', '18')),
+      seller_max_discount: Number(getSetting('seller_max_discount', '100')),
+      seller_can_change_price: flag('seller_can_change_price'),
+      seller_can_credit: flag('seller_can_credit', '1'),
+      phone_prefix: getSetting('phone_prefix', '221'),
+      currency: getSetting('currency', 'FCFA'),
     }));
 
-    // ---- Impression thermique 80 mm : le navigateur dessine le ticket (FR/AR), le serveur l'envoie en ESC/POS ----
+    // ---- Impression thermique : le navigateur dessine le ticket (FR/AR), le serveur l'envoie en ESC/POS ----
     api.post('/api/print', async (req) => {
       const target = getSetting('printer', '');
       if (!target) throw fail(400, 'no_printer');
@@ -139,7 +151,8 @@ export default async function routes(app) {
     api.get('/api/products', async (req) => {
       const all = req.query.all === '1' && req.user.role === 'manager';
       return db.prepare(
-        `SELECT p.*, (SELECT COUNT(*) FROM product_images i WHERE i.product_id = p.id) AS image_count
+        `SELECT p.*, (SELECT COUNT(*) FROM product_images i WHERE i.product_id = p.id) AS image_count,
+                (SELECT COUNT(*) FROM stock_lots l WHERE l.product_id = p.id AND l.qty > 0) AS lot_count
          FROM products p ${all ? '' : 'WHERE p.active=1'} ORDER BY p.name_fr`).all();
     });
 
@@ -160,104 +173,48 @@ export default async function routes(app) {
       };
     });
 
-    // ---- Vente ----
-    api.post('/api/sales', async (req) => {
-      const { clientId, items, paymentMethod, discount = 0, cashGiven = null } = req.body ?? {};
-      if (!Array.isArray(items) || !items.length) throw fail(400, 'empty_cart');
-      if (!['cash', 'mobile'].includes(paymentMethod)) throw fail(400, 'invalid_payment');
-
-      const allowNeg = getSetting('allow_negative_stock', '0') === '1';
-      const result = tx(() => {
-        // Idempotence : une vente envoyée deux fois (file d'attente hors-ligne) n'est enregistrée qu'une fois.
-        if (clientId) {
-          const dup = db.prepare('SELECT id FROM sales WHERE client_id=?').get(clientId);
-          if (dup) return { id: dup.id, duplicate: true };
-        }
-        const lines = [];
-        let subtotal = 0;
-        for (const it of items) {
-          const qty = Number(it.qty);
-          const p = db.prepare('SELECT * FROM products WHERE id=? AND active=1').get(it.productId);
-          if (!p) throw fail(404, 'product_not_found', { productId: it.productId });
-          if (!(qty > 0)) throw fail(400, 'invalid_qty', { productId: p.id });
-          if (p.unit === 'piece' && !Number.isInteger(qty)) throw fail(400, 'invalid_qty', { productId: p.id });
-          if (!allowNeg && p.stock < qty) {
-            throw fail(409, 'insufficient_stock', { productId: p.id, available: p.stock });
-          }
-          const line_total = Math.round(qty * p.price);
-          subtotal += line_total;
-          lines.push({ p, qty, line_total });
-        }
-        const disc = Math.round(Number(discount) || 0);
-        if (disc < 0 || disc > subtotal) throw fail(400, 'invalid_discount');
-        const total = subtotal - disc;
-        if (paymentMethod === 'cash' && cashGiven != null && Number(cashGiven) < total) {
-          throw fail(400, 'cash_insufficient');
-        }
-
-        const { lastInsertRowid: saleId } = db.prepare(
-          `INSERT INTO sales(client_id, employee_id, subtotal, discount, total, payment_method, cash_given)
-           VALUES(?,?,?,?,?,?,?)`).run(clientId ?? null, req.user.id, subtotal, disc, total, paymentMethod,
-          paymentMethod === 'cash' && cashGiven != null ? Math.round(Number(cashGiven)) : null);
-
-        const insItem = db.prepare(
-          `INSERT INTO sale_items(sale_id, product_id, name_fr, name_ar, qty, unit_price, line_total)
-           VALUES(?,?,?,?,?,?,?)`);
-        const updStock = db.prepare('UPDATE products SET stock = stock - ? WHERE id=?');
-        const insMove = db.prepare(
-          'INSERT INTO stock_movements(product_id, delta, reason, ref, employee_id) VALUES(?,?,?,?,?)');
-        for (const l of lines) {
-          insItem.run(saleId, l.p.id, l.p.name_fr, l.p.name_ar, l.qty, l.p.price, l.line_total);
-          updStock.run(l.qty, l.p.id);
-          insMove.run(l.p.id, -l.qty, 'sale', `sale:${saleId}`, req.user.id);
-        }
-        return { id: Number(saleId), changed: lines.map((l) => l.p.id) };
-      });
-
-      if (result.changed) broadcast('stock', { productIds: result.changed });
-      return getSale(result.id, result.duplicate);
-    });
-
-    api.get('/api/sales', async (req) => {
-      const date = req.query.date || new Date().toLocaleDateString('sv-SE');
-      const mine = req.user.role === 'manager' ? '' : 'AND s.employee_id = @uid';
-      return db.prepare(
-        `SELECT s.*, e.name AS employee_name FROM sales s
-         JOIN employees e ON e.id = s.employee_id
-         WHERE date(s.created_at) = @date ${mine}
-         ORDER BY s.id DESC`).all({ date, ...(mine ? { uid: req.user.id } : {}) });
-    });
-
-    api.get('/api/sales/:id', async (req) => {
-      const s = getSale(Number(req.params.id));
-      if (req.user.role !== 'manager' && s.employee_id !== req.user.id) throw fail(403, 'forbidden');
-      return s;
-    });
+    saleRoutes(api);
+    customerRoutes(api);
 
     // ---------------- Gérant uniquement ----------------
     await api.register(async (mgr) => {
       mgr.addHook('onRequest', requireManager);
 
-      mgr.post('/api/sales/:id/void', async (req) => {
+      saleManagerRoutes(mgr);
+      customerManagerRoutes(mgr);
+      purchaseRoutes(mgr);
+      cashRoutes(mgr);
+      reportRoutes(mgr);
+      backupRoutes(mgr);
+
+      // Catégories
+      const categoryFields = (b) => {
+        const name_fr = text(b.name_fr, 80);
+        if (!name_fr) throw fail(400, 'name_required');
+        return { name_fr, name_ar: text(b.name_ar, 80), icon: text(b.icon, 8) || '🛒' };
+      };
+      mgr.post('/api/categories', async (req) => {
+        const f = categoryFields(req.body ?? {});
+        const { lastInsertRowid } = db.prepare('INSERT INTO categories(name_fr, name_ar, icon) VALUES(@name_fr, @name_ar, @icon)').run(f);
+        broadcast('settings');
+        return db.prepare('SELECT * FROM categories WHERE id=?').get(lastInsertRowid);
+      });
+      mgr.put('/api/categories/:id', async (req) => {
         const id = Number(req.params.id);
-        const reason = String(req.body?.reason ?? '').trim();
-        if (!reason) throw fail(400, 'reason_required');
-        const changed = tx(() => {
-          const s = db.prepare('SELECT * FROM sales WHERE id=?').get(id);
-          if (!s) throw fail(404, 'not_found');
-          if (s.status === 'voided') throw fail(409, 'already_voided');
-          db.prepare("UPDATE sales SET status='voided', voided_by=?, void_reason=? WHERE id=?")
-            .run(req.user.id, reason, id);
-          const items = db.prepare('SELECT * FROM sale_items WHERE sale_id=?').all(id);
-          for (const it of items) {
-            db.prepare('UPDATE products SET stock = stock + ? WHERE id=?').run(it.qty, it.product_id);
-            db.prepare('INSERT INTO stock_movements(product_id, delta, reason, ref, employee_id) VALUES(?,?,?,?,?)')
-              .run(it.product_id, it.qty, 'void', `sale:${id}`, req.user.id);
-          }
-          return items.map((i) => i.product_id);
+        const res = db.prepare('UPDATE categories SET name_fr=@name_fr, name_ar=@name_ar, icon=@icon WHERE id=@id')
+          .run({ ...categoryFields(req.body ?? {}), id });
+        if (!res.changes) throw fail(404, 'not_found');
+        broadcast('settings');
+        return db.prepare('SELECT * FROM categories WHERE id=?').get(id);
+      });
+      mgr.delete('/api/categories/:id', async (req) => {
+        const id = Number(req.params.id);
+        tx(() => {
+          db.prepare('UPDATE products SET category_id = NULL WHERE category_id = ?').run(id);
+          db.prepare('DELETE FROM categories WHERE id = ?').run(id);
         });
-        broadcast('stock', { productIds: changed });
-        return getSale(id);
+        broadcast('settings');
+        return { ok: true };
       });
 
       // Produits
@@ -268,6 +225,8 @@ export default async function routes(app) {
         if (!(price >= 0)) throw fail(400, 'invalid_price');
         const unit = b.unit ?? 'piece';
         if (!['piece', 'kg', 'litre'].includes(unit)) throw fail(400, 'invalid_unit');
+        const rate = b.tax_rate === '' || b.tax_rate == null ? null : Number(b.tax_rate);
+        if (rate != null && !(rate >= 0 && rate <= 100)) throw fail(400, 'invalid_input');
         return {
           name_fr, name_ar: String(b.name_ar ?? '').trim(),
           barcode: String(b.barcode ?? '').trim() || null,
@@ -275,6 +234,7 @@ export default async function routes(app) {
           cost: Math.round(Number(b.cost) || 0),
           min_stock: Number(b.min_stock) || 0,
           expiry_date: b.expiry_date || null,
+          tax_rate: rate,
           active: b.active === false || b.active === 0 ? 0 : 1,
         };
       };
@@ -285,31 +245,49 @@ export default async function routes(app) {
         }
       };
 
+      const insertProduct = (f, initial, employeeId) => {
+        const { lastInsertRowid } = db.prepare(
+          `INSERT INTO products(name_fr,name_ar,barcode,category_id,unit,price,cost,stock,min_stock,expiry_date,tax_rate,active)
+           VALUES(@name_fr,@name_ar,@barcode,@category_id,@unit,@price,@cost,@stock,@min_stock,@expiry_date,@tax_rate,@active)`)
+          .run({ ...f, stock: initial });
+        const id = Number(lastInsertRowid);
+        if (initial) {
+          addMovement(id, initial, 'initial', null, employeeId);
+          if (f.expiry_date && initial > 0) addLot(id, { qty: initial, expiry: f.expiry_date, source: 'initial' });
+        }
+        return id;
+      };
+
       mgr.post('/api/products', async (req) => {
         const f = productFields(req.body ?? {});
         const initial = Number(req.body?.stock) || 0;
-        const id = uniqueBarcode(() => tx(() => {
-          const { lastInsertRowid } = db.prepare(
-            `INSERT INTO products(name_fr,name_ar,barcode,category_id,unit,price,cost,stock,min_stock,expiry_date,active)
-             VALUES(@name_fr,@name_ar,@barcode,@category_id,@unit,@price,@cost,@stock,@min_stock,@expiry_date,@active)`)
-            .run({ ...f, stock: initial });
-          if (initial) {
-            db.prepare('INSERT INTO stock_movements(product_id,delta,reason,employee_id) VALUES(?,?,?,?)')
-              .run(lastInsertRowid, initial, 'initial', req.user.id);
-          }
-          return Number(lastInsertRowid);
-        }));
+        const id = uniqueBarcode(() => tx(() => insertProduct(f, initial, req.user.id)));
         broadcast('stock', { productIds: [id] });
         return db.prepare('SELECT * FROM products WHERE id=?').get(id);
       });
 
+      /** La date saisie sur la fiche s'applique au lot unique ; avec plusieurs lots, elle est calculée. */
+      const applyExpiry = (id, date) => {
+        const lots = db.prepare('SELECT * FROM stock_lots WHERE product_id = ? AND qty > 0').all(id);
+        if (lots.length === 1) db.prepare('UPDATE stock_lots SET expiry_date = ? WHERE id = ?').run(date, lots[0].id);
+        if (lots.length === 0) {
+          const { stock } = db.prepare('SELECT stock FROM products WHERE id = ?').get(id);
+          if (date && stock > 0) addLot(id, { qty: stock, expiry: date, source: 'fiche' });
+          return;
+        }
+        syncExpiry(id);
+      };
+
       mgr.put('/api/products/:id', async (req) => {
         const id = Number(req.params.id);
         const f = productFields(req.body ?? {});
-        uniqueBarcode(() => db.prepare(
-          `UPDATE products SET name_fr=@name_fr,name_ar=@name_ar,barcode=@barcode,category_id=@category_id,
-           unit=@unit,price=@price,cost=@cost,min_stock=@min_stock,expiry_date=@expiry_date,active=@active
-           WHERE id=@id`).run({ ...f, id }));
+        uniqueBarcode(() => tx(() => {
+          db.prepare(
+            `UPDATE products SET name_fr=@name_fr,name_ar=@name_ar,barcode=@barcode,category_id=@category_id,
+             unit=@unit,price=@price,cost=@cost,min_stock=@min_stock,expiry_date=@expiry_date,tax_rate=@tax_rate,active=@active
+             WHERE id=@id`).run({ ...f, id });
+          applyExpiry(id, f.expiry_date);
+        }));
         broadcast('stock', { productIds: [id] });
         return db.prepare('SELECT * FROM products WHERE id=?').get(id);
       });
@@ -317,17 +295,97 @@ export default async function routes(app) {
       // Réapprovisionnement / correction d'inventaire
       mgr.post('/api/products/:id/stock', async (req) => {
         const id = Number(req.params.id);
-        const delta = Number(req.body?.delta);
-        const reason = ['restock', 'adjustment', 'loss'].includes(req.body?.reason) ? req.body.reason : 'adjustment';
+        const b = req.body ?? {};
+        const delta = Number(b.delta);
+        const reason = ['restock', 'adjustment', 'loss'].includes(b.reason) ? b.reason : 'adjustment';
         if (!Number.isFinite(delta) || delta === 0) throw fail(400, 'invalid_qty');
+        const expiry = b.expiry_date || null;
+        if (expiry && !isDate(expiry)) throw fail(400, 'invalid_input');
         tx(() => {
           if (!db.prepare('SELECT 1 FROM products WHERE id=?').get(id)) throw fail(404, 'not_found');
-          db.prepare('UPDATE products SET stock = stock + ? WHERE id=?').run(delta, id);
-          db.prepare('INSERT INTO stock_movements(product_id,delta,reason,employee_id) VALUES(?,?,?,?)')
-            .run(id, delta, reason, req.user.id);
+          changeStock(id, delta);
+          if (delta < 0) consumeLots(id, -delta);
+          else if (expiry || b.lot_code) addLot(id, { qty: delta, expiry, code: text(b.lot_code, 60), source: reason });
+          addMovement(id, delta, reason, null, req.user.id);
         });
         broadcast('stock', { productIds: [id] });
         return db.prepare('SELECT * FROM products WHERE id=?').get(id);
+      });
+
+      mgr.get('/api/products/:id/lots', async (req) =>
+        db.prepare(`SELECT * FROM stock_lots WHERE product_id = ? AND qty > 0
+                    ORDER BY (expiry_date IS NULL OR expiry_date = ''), expiry_date, id`).all(Number(req.params.id)));
+
+      // Historique des entrées et sorties
+      mgr.get('/api/stock-movements', async (req) => {
+        const productId = Number(req.query.productId) || null;
+        const limit = Math.min(Number(req.query.limit) || 200, 1000);
+        return db.prepare(
+          `SELECT m.*, e.name AS employee_name, p.name_fr, p.name_ar, p.unit
+           FROM stock_movements m JOIN products p ON p.id = m.product_id LEFT JOIN employees e ON e.id = m.employee_id
+           ${productId ? 'WHERE m.product_id = @productId' : ''} ORDER BY m.id DESC LIMIT @limit`)
+          .all(productId ? { productId, limit } : { limit });
+      });
+
+      // Import depuis un fichier CSV (les colonnes sont celles de l'export)
+      mgr.post('/api/products/import', { bodyLimit: 10 * 1024 * 1024 }, async (req) => {
+        const rows = req.body?.rows;
+        if (!Array.isArray(rows)) throw fail(400, 'invalid_input');
+        const updateStock = !!req.body.updateStock;
+        const out = { created: 0, updated: 0, errors: [] };
+        const changed = tx(() => {
+          const ids = [];
+          const findCategory = (name) => {
+            const clean = text(name, 80);
+            if (!clean) return null;
+            const hit = db.prepare('SELECT id FROM categories WHERE lower(name_fr) = lower(?)').get(clean);
+            if (hit) return hit.id;
+            return Number(db.prepare("INSERT INTO categories(name_fr, name_ar) VALUES(?, '')").run(clean).lastInsertRowid);
+          };
+          rows.forEach((r, i) => {
+            try {
+              const barcode = String(r.barcode ?? '').trim();
+              const found = (barcode && db.prepare('SELECT * FROM products WHERE barcode = ?').get(barcode))
+                || db.prepare('SELECT * FROM products WHERE lower(name_fr) = lower(?)').get(String(r.name_fr ?? '').trim());
+              const f = productFields({
+                ...r, active: r.active === undefined ? (found ? found.active : 1) : Number(r.active) !== 0,
+                barcode: barcode || found?.barcode || '',
+                name_ar: r.name_ar ?? found?.name_ar ?? '',
+                unit: r.unit || found?.unit || 'piece',
+                price: r.price === undefined || r.price === '' ? found?.price : r.price,
+                category_id: r.category ? findCategory(r.category) : found?.category_id ?? null,
+                cost: r.cost === undefined || r.cost === '' ? found?.cost ?? 0 : r.cost,
+                min_stock: r.min_stock === undefined || r.min_stock === '' ? found?.min_stock ?? 0 : r.min_stock,
+                expiry_date: r.expiry_date || found?.expiry_date || null,
+                tax_rate: found?.tax_rate ?? null,
+              });
+              if (!found) {
+                ids.push(insertProduct(f, Number(r.stock) || 0, req.user.id));
+                out.created += 1;
+                return;
+              }
+              db.prepare(
+                `UPDATE products SET name_fr=@name_fr,name_ar=@name_ar,barcode=@barcode,category_id=@category_id,
+                 unit=@unit,price=@price,cost=@cost,min_stock=@min_stock,expiry_date=@expiry_date,tax_rate=@tax_rate,active=@active
+                 WHERE id=@id`).run({ ...f, id: found.id });
+              if (updateStock && r.stock !== undefined && r.stock !== '') {
+                const delta = Number(r.stock) - found.stock;
+                if (delta) {
+                  changeStock(found.id, delta);
+                  if (delta < 0) consumeLots(found.id, -delta);
+                  addMovement(found.id, delta, 'adjustment', 'import', req.user.id);
+                }
+              }
+              ids.push(found.id);
+              out.updated += 1;
+            } catch (e) {
+              out.errors.push({ line: i + 2, error: String(e.message).includes('UNIQUE') ? 'barcode_exists' : e.message });
+            }
+          });
+          return ids;
+        });
+        broadcast('stock', { productIds: changed });
+        return out;
       });
 
       // Codes-barres internes (pour les produits qui n'en ont pas)
@@ -420,16 +478,31 @@ export default async function routes(app) {
       mgr.put('/api/settings', async (req) => {
         const b = req.body ?? {};
         if (b.shop_name !== undefined) setSetting('shop_name', String(b.shop_name).trim() || 'Mon Magasin');
-        if (b.ticket_footer !== undefined) setSetting('ticket_footer', String(b.ticket_footer));
-        if (b.allow_negative_stock !== undefined) setSetting('allow_negative_stock', b.allow_negative_stock ? '1' : '0');
+        for (const [k, max] of [['ticket_footer', 300], ['shop_address', 200], ['shop_phone', 50], ['shop_tax_id', 60]]) {
+          if (b[k] !== undefined) setSetting(k, text(b[k], max));
+        }
+        for (const k of ['allow_negative_stock', 'auto_print', 'printer_cut', 'cash_drawer', 'tax_enabled', 'seller_can_change_price', 'seller_can_credit']) {
+          if (b[k] !== undefined) setSetting(k, b[k] ? '1' : '0');
+        }
+        for (const k of ['tax_rate', 'seller_max_discount']) {
+          if (b[k] === undefined) continue;
+          const v = Number(b[k]);
+          if (!(v >= 0 && v <= 100)) throw fail(400, 'invalid_input');
+          setSetting(k, String(v));
+        }
+        if (b.paper_width !== undefined) {
+          if (![58, 80].includes(Number(b.paper_width))) throw fail(400, 'invalid_input');
+          setSetting('paper_width', String(Number(b.paper_width)));
+        }
+        if (b.currency !== undefined) setSetting('currency', text(b.currency, 8) || 'FCFA');
+        if (b.phone_prefix !== undefined) setSetting('phone_prefix', String(b.phone_prefix).replace(/\D/g, '').slice(0, 4));
         if (b.printer !== undefined) {
           const p = String(b.printer);
           const testFile = process.env.PRINT_TO_FILE_DIR && p === 'file:test';
           if (p && !testFile && !/^(usb:.+|tcp:[\w.\-]+(:\d{1,5})?)$/.test(p)) throw fail(400, 'invalid_input');
           setSetting('printer', p);
         }
-        if (b.auto_print !== undefined) setSetting('auto_print', b.auto_print ? '1' : '0');
-        if (b.printer_cut !== undefined) setSetting('printer_cut', b.printer_cut ? '1' : '0');
+        broadcast('settings');
         return { ok: true };
       });
 
@@ -437,43 +510,12 @@ export default async function routes(app) {
         try { return { printers: await listPrinters() }; } catch (e) { return { printers: [], error: e.message }; }
       });
 
-      // Clôture / rapport du jour
-      mgr.get('/api/reports/day', async (req) => {
-        const date = req.query.date || new Date().toLocaleDateString('sv-SE');
-        const done = "date(created_at)=? AND status='completed'";
-        const totals = db.prepare(
-          `SELECT COUNT(*) AS count, COALESCE(SUM(total),0) AS total, COALESCE(SUM(discount),0) AS discounts
-           FROM sales WHERE ${done}`).get(date);
-        const byPayment = db.prepare(
-          `SELECT payment_method, COUNT(*) AS count, SUM(total) AS total FROM sales WHERE ${done} GROUP BY payment_method`).all(date);
-        const byEmployee = db.prepare(
-          `SELECT e.name, COUNT(*) AS count, SUM(s.total) AS total FROM sales s
-           JOIN employees e ON e.id=s.employee_id
-           WHERE date(s.created_at)=? AND s.status='completed' GROUP BY e.id ORDER BY total DESC`).all(date);
-        const voided = db.prepare(
-          "SELECT COUNT(*) c, COALESCE(SUM(total),0) t FROM sales WHERE date(created_at)=? AND status='voided'").get(date);
-        const top = db.prepare(
-          `SELECT i.name_fr, i.name_ar, SUM(i.qty) AS qty, SUM(i.line_total) AS total FROM sale_items i
-           JOIN sales s ON s.id=i.sale_id
-           WHERE date(s.created_at)=? AND s.status='completed'
-           GROUP BY i.product_id ORDER BY total DESC LIMIT 5`).all(date);
-        const lowStock = db.prepare(
-          'SELECT id,name_fr,name_ar,unit,stock,min_stock FROM products WHERE active=1 AND stock <= min_stock ORDER BY stock').all();
-        const expiring = db.prepare(
-          `SELECT id,name_fr,name_ar,expiry_date,stock FROM products
-           WHERE active=1 AND expiry_date IS NOT NULL AND expiry_date <= date('now','localtime','+7 day')
-           ORDER BY expiry_date`).all();
-        return { date, ...totals, byPayment, byEmployee, voided, top, lowStock, expiring };
+      mgr.post('/api/drawer', async () => {
+        const target = getSetting('printer', '');
+        if (!target) throw fail(400, 'no_printer');
+        try { await sendToPrinter(target, DRAWER_PULSE); } catch (e) { throw fail(502, 'print_failed', { detail: e.message }); }
+        return { ok: true };
       });
     });
   });
-}
-
-function getSale(id, duplicate = false) {
-  const sale = db.prepare(
-    `SELECT s.*, e.name AS employee_name FROM sales s JOIN employees e ON e.id=s.employee_id WHERE s.id=?`).get(id);
-  if (!sale) throw fail(404, 'not_found');
-  sale.items = db.prepare('SELECT * FROM sale_items WHERE sale_id=?').all(id);
-  if (duplicate) sale.duplicate = true;
-  return sale;
 }

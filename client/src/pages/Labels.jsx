@@ -38,7 +38,7 @@ export default function Labels({ onBack }) {
     try {
       for (let i = 0; i < items.length; i++) {
         setBusy(`${t.printingLabels} ${i + 1}/${items.length}`);
-        await printLabelBitmap(items[i], { lang, showPrice, showAr });
+        await printLabelBitmap(items[i], { lang, showPrice, showAr, paper: settings.paper_width });
       }
       notify(t.printSent);
     } catch (e) {

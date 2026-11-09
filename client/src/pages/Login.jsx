@@ -1,16 +1,21 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
-import { useI18n, errText } from '../i18n.js';
+import { useI18n, errText, LANGS } from '../i18n.js';
+
+const LANG_BUTTON = { fr: 'Français', ar: 'عربي', en: 'English' };
 
 export default function Login({ onLogin }) {
   const { t, lang, setLang } = useI18n();
   const [employees, setEmployees] = useState(null);
+  const [unreachable, setUnreachable] = useState(false);
   const [emp, setEmp] = useState(null);
   const [pin, setPin] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => { api('/employees/public').then(setEmployees).catch(() => setEmployees([])); }, []);
+  useEffect(() => {
+    api('/employees/public').then(setEmployees).catch(() => { setUnreachable(true); setEmployees([]); });
+  }, []);
 
   const submit = async (p) => {
     setBusy(true); setError('');
@@ -30,19 +35,19 @@ export default function Login({ onLogin }) {
     setPin(next);
   };
 
+  const nextLang = LANGS[(LANGS.indexOf(lang) + 1) % LANGS.length];
+
   return (
     <div className="mx-auto flex h-full max-w-md flex-col justify-center gap-4 p-5">
       <div className="flex items-center justify-between">
         <div className="text-2xl font-bold text-green-700">🛒 {t.appName}</div>
-        <button className="btn btn-secondary !min-h-10 !py-1" onClick={() => setLang(lang === 'fr' ? 'ar' : 'fr')}>
-          {lang === 'fr' ? 'عربي' : 'Français'}
-        </button>
+        <button className="btn btn-secondary !min-h-10 !py-1" onClick={() => setLang(nextLang)}>{LANG_BUTTON[nextLang]}</button>
       </div>
 
       {!emp ? (
         <div className="card p-5">
           <h1 className="mb-4 text-xl font-bold">{t.whoAreYou}</h1>
-          {employees === null ? <p className="text-slate-500">{t.loading}</p> : employees.length === 0 ? <p>{t.noEmployees}</p> : (
+          {employees === null ? <p className="text-slate-500">{t.loading}</p> : unreachable ? <p className="text-red-600">{t.needServer}</p> : employees.length === 0 ? <p>{t.noEmployees}</p> : (
             <div className="grid gap-3">
               {employees.map((e) => (
                 <button key={e.id} className="btn btn-secondary !justify-start !py-4 text-lg" onClick={() => setEmp(e)}>

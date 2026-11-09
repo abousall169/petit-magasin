@@ -19,13 +19,16 @@ button, input, select { font: inherit; }
 }
 
 /* Ticket : n'imprime que le reçu (imprimante thermique 58/80 mm) */
-#receipt-print, #labels-print { display: none; }
+#receipt-print, #labels-print, #a4-print { display: none; }
 @media print {
   @page { margin: 0; }
   #root { display: none !important; } /* seuls les tickets et feuilles (portails dans body) sont imprimés */
   body * { visibility: hidden; }
   html, body, #root { height: auto; background: #fff; }
-  #receipt-print, #receipt-print *, #labels-print, #labels-print * { visibility: visible; }
+  #receipt-print, #receipt-print *, #labels-print, #labels-print *, #a4-print, #a4-print * { visibility: visible; }
   #labels-print { display: block; position: absolute; inset-inline-start: 0; top: 0; width: 210mm; }
   #receipt-print { display: block; position: absolute; inset-inline-start: 0; top: 0; width: 72mm; padding: 3mm; color: #000; font-size: 12px; line-height: 1.35; }
+  /* Facture ou rapport A4 : le ticket affiché à l'écran ne doit pas sortir avec */
+  body.print-a4 #receipt-print, body.print-a4 #labels-print { display: none !important; }
+  #a4-print { display: block; position: absolute; inset-inline-start: 0; top: 0; width: 100%; }
 }

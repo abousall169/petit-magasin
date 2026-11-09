@@ -1,12 +1,13 @@
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
-import { existsSync, copyFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { db, seedIfEmpty, DATA_DIR } from './db.js';
+import { seedIfEmpty } from './db.js';
 import routes from './routes.js';
 import installPlugin from './install.js';
 import { ensureTls, lanIPs } from './tls.js';
+import { dailyBackup } from './backup.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HTTP_PORT = Number(process.env.PORT) || 3000;
@@ -21,7 +22,7 @@ if (HTTPS_ON) {
   try { tls = ensureTls(); } catch (e) { console.error('HTTPS indisponible :', e.message); }
 }
 
-const dist = resolve(__dirname, '../../client/dist');
+const dist = process.env.CLIENT_DIST || resolve(__dirname, '../../client/dist');
 
 async function buildApp(opts = {}) {
   const app = Fastify({ logger: { level: 'warn' }, trustProxy: true, ...opts });
@@ -35,27 +36,9 @@ async function buildApp(opts = {}) {
   return app;
 }
 
-// Sauvegarde quotidienne (garde 14 jours) : data/backups/magasin-AAAA-MM-JJ.db
-function backup() {
-  const dir = resolve(DATA_DIR, 'backups');
-  const day = new Date().toLocaleDateString('sv-SE');
-  const file = resolve(dir, `magasin-${day}.db`);
-  try {
-    mkdirSync(dir, { recursive: true });
-    if (!existsSync(file)) {
-      db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-      setTimeout(() => {
-        copyFileSync(resolve(DATA_DIR, 'magasin.db'), file);
-        for (const f of readdirSync(dir)) {
-          const p = resolve(dir, f);
-          if (Date.now() - statSync(p).mtimeMs > 14 * 86400_000) unlinkSync(p);
-        }
-      }, 500);
-    }
-  } catch (e) { console.error('Sauvegarde échouée :', e.message); }
-}
-backup();
-setInterval(backup, 6 * 3600_000);
+// Sauvegarde refaite toutes les 6 heures (garde 14 jours) : data/backups/magasin-AAAA-MM-JJ.db
+dailyBackup();
+setInterval(dailyBackup, 6 * 3600_000);
 
 const http = await buildApp();
 await http.listen({ port: HTTP_PORT, host: '0.0.0.0' });

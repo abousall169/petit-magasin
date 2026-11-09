@@ -9,6 +9,9 @@ import { randomBytes } from 'node:crypto';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PS1 = resolve(__dirname, 'rawprint.ps1');
 
+// ESC p 0 25 250 : impulsion sur la broche du tiroir-caisse branché à l'imprimante.
+export const DRAWER_PULSE = Buffer.from([0x1b, 0x70, 0x00, 0x19, 0xfa]);
+
 const run = (cmd, args, timeout = 20000) => new Promise((res, rej) =>
   execFile(cmd, args, { timeout, windowsHide: true, maxBuffer: 1 << 20 }, (err, stdout, stderr) =>
     err ? rej(new Error((stderr || err.message).trim().split('\n')[0])) : res(stdout)));
